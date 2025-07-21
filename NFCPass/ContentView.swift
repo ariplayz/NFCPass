@@ -35,15 +35,13 @@ class NFCScanner: NSObject, ObservableObject, NFCNDEFReaderSessionDelegate {
         loadTags()
     }
 
-    // Start reading session
     func startReadSession() {
         tagToWrite = nil
-        readSession = NFCNDEFReaderSession(delegate: self, queue: nil, invalidateAfterFirstRead: true)
+        readSession = NFCNDEFReaderSession(delegate: self, queue: nil, invalidateAfterFirstRead: false)
         readSession?.alertMessage = "Hold your iPhone near an NFC tag to read."
         readSession?.begin()
     }
 
-    // Start writing session
     func startWriteSession(with tag: Tag) {
         tagToWrite = tag
         writeSession = NFCNDEFReaderSession(delegate: self, queue: nil, invalidateAfterFirstRead: false)
@@ -51,13 +49,11 @@ class NFCScanner: NSObject, ObservableObject, NFCNDEFReaderSessionDelegate {
         writeSession?.begin()
     }
 
-    // Required delegate method
     func readerSessionDidBecomeActive(_ session: NFCNDEFReaderSession) {
         print("NFC Session did become active")
     }
 
     func readerSession(_ session: NFCNDEFReaderSession, didInvalidateWithError error: Error) {
-        // Only show real errors, ignore user cancel or timeout
         if let readerError = error as? NFCReaderError {
             if readerError.code == .readerSessionInvalidationErrorUserCanceled ||
                 readerError.code == .readerSessionInvalidationErrorSessionTimeout {
@@ -69,11 +65,15 @@ class NFCScanner: NSObject, ObservableObject, NFCNDEFReaderSessionDelegate {
         }
     }
 
-    // When a tag is read
+    // ✅ Primary: detects normal NDEF
     func readerSession(_ session: NFCNDEFReaderSession, didDetectNDEFs messages: [NFCNDEFMessage]) {
         guard session == readSession else { return }
-
-        let payloads = messages.flatMap { $0.records }
+        guard let message = messages.first else {
+            session.alertMessage = "No NDEF found."
+            session.invalidate()
+            return
+        }
+        let payloads = message.records
         let data = payloads.map { record in
             if record.typeNameFormat == .nfcWellKnown,
                let type = String(data: record.type, encoding: .utf8),
@@ -97,9 +97,72 @@ class NFCScanner: NSObject, ObservableObject, NFCNDEFReaderSessionDelegate {
         session.invalidate()
     }
 
-    // When a tag is found for writing
+    // ✅ Fallback: detects empty/unformatted tags
     func readerSession(_ session: NFCNDEFReaderSession, didDetect tags: [NFCNDEFTag]) {
-        guard session == writeSession else { return }
+        if session == writeSession {
+            handleWrite(tags: tags, session: session)
+        } else if session == readSession {
+            guard let tag = tags.first else {
+                session.alertMessage = "No tag found."
+                session.invalidate()
+                return
+            }
+            session.connect(to: tag) { [weak self] error in
+                if let error = error {
+                    session.alertMessage = "Connection failed: \(error.localizedDescription)"
+                    session.invalidate()
+                    return
+                }
+
+                tag.queryNDEFStatus { status, capacity, error in
+                    if let error = error {
+                        session.alertMessage = "Status failed: \(error.localizedDescription)"
+                        session.invalidate()
+                        return
+                    }
+
+                    if status == .notSupported {
+                        session.alertMessage = "Tag not supported."
+                        session.invalidate()
+                        return
+                    }
+
+                    tag.readNDEF { message, error in
+                        if let error = error {
+                            session.alertMessage = "Read failed: \(error.localizedDescription)"
+                        } else if let message = message {
+                            let payloads = message.records
+                            let data = payloads.map { record in
+                                if record.typeNameFormat == .nfcWellKnown,
+                                   let type = String(data: record.type, encoding: .utf8),
+                                   type == "T",
+                                   record.payload.count > 3 {
+                                    let statusByte = record.payload[0]
+                                    let langCodeLen = Int(statusByte & 0x3F)
+                                    let textData = record.payload.subdata(in: (1 + langCodeLen)..<record.payload.count)
+                                    return String(data: textData, encoding: .utf8) ?? "Unreadable tag"
+                                } else {
+                                    return record.payload.map { String(format: "%02x", $0) }.joined()
+                                }
+                            }.joined(separator: "\n")
+
+                            DispatchQueue.main.async {
+                                let newTag = Tag(name: "New Tag", nfcData: data, timestamp: Date())
+                                self?.tags.append(newTag)
+                            }
+
+                            session.alertMessage = "NFC tag read successfully!"
+                        } else {
+                            session.alertMessage = "No NDEF message found."
+                        }
+                        session.invalidate()
+                    }
+                }
+            }
+        }
+    }
+
+    private func handleWrite(tags: [NFCNDEFTag], session: NFCNDEFReaderSession) {
         guard let nfcTag = tags.first, let tagToWrite = tagToWrite else {
             session.alertMessage = "No tag or no data to write."
             session.invalidate()
@@ -327,7 +390,7 @@ struct TagDetailSheet: View {
     }
 }
 
-// MARK: - Rounded corner helper
+// MARK: - Helper
 extension View {
     func cornerRadius(_ radius: CGFloat, corners: UIRectCorner) -> some View {
         clipShape(RoundedCorner(radius: radius, corners: corners))
