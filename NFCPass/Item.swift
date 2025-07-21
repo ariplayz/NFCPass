@@ -1,18 +1,13 @@
-//
-//  Item.swift
-//  NFCPass
-//
-//  Created by Ari Greene Cummings on 7/20/25.
-//
-
 import Foundation
 import SwiftData
 
 @Model
-final class Item {
+class Item {
     var timestamp: Date
-    
-    init(timestamp: Date) {
+    var nfcData: String?
+
+    init(timestamp: Date, nfcData: String? = nil) {
         self.timestamp = timestamp
+        self.nfcData = nfcData
     }
 }
