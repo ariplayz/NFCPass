@@ -1,6 +1,7 @@
 import SwiftUI
 import CoreNFC
 
+// MARK: - Tag model
 struct Tag: Identifiable, Equatable, Codable {
     let id: UUID
     var name: String
@@ -15,32 +16,63 @@ struct Tag: Identifiable, Equatable, Codable {
     }
 }
 
+// MARK: - NFC Manager
 class NFCScanner: NSObject, ObservableObject, NFCNDEFReaderSessionDelegate {
     @Published var tags: [Tag] = [] {
         didSet { saveTags() }
     }
     @Published var scanError: String?
 
-    private var session: NFCNDEFReaderSession?
     private let tagsKey = "NFCPassTags"
+
+    private var readSession: NFCNDEFReaderSession?
+    private var writeSession: NFCNDEFReaderSession?
+
+    private var tagToWrite: Tag?
 
     override init() {
         super.init()
         loadTags()
     }
 
-    func startScan() {
-        session = NFCNDEFReaderSession(delegate: self, queue: nil, invalidateAfterFirstRead: false)
-        session?.begin()
+    // Start reading session
+    func startReadSession() {
+        tagToWrite = nil
+        readSession = NFCNDEFReaderSession(delegate: self, queue: nil, invalidateAfterFirstRead: true)
+        readSession?.alertMessage = "Hold your iPhone near an NFC tag to read."
+        readSession?.begin()
+    }
+
+    // Start writing session
+    func startWriteSession(with tag: Tag) {
+        tagToWrite = tag
+        writeSession = NFCNDEFReaderSession(delegate: self, queue: nil, invalidateAfterFirstRead: false)
+        writeSession?.alertMessage = "Hold your iPhone near an NFC tag to write."
+        writeSession?.begin()
+    }
+
+    // Required delegate method
+    func readerSessionDidBecomeActive(_ session: NFCNDEFReaderSession) {
+        print("NFC Session did become active")
     }
 
     func readerSession(_ session: NFCNDEFReaderSession, didInvalidateWithError error: Error) {
+        // Only show real errors, ignore user cancel or timeout
+        if let readerError = error as? NFCReaderError {
+            if readerError.code == .readerSessionInvalidationErrorUserCanceled ||
+                readerError.code == .readerSessionInvalidationErrorSessionTimeout {
+                return
+            }
+        }
         DispatchQueue.main.async {
             self.scanError = error.localizedDescription
         }
     }
 
+    // When a tag is read
     func readerSession(_ session: NFCNDEFReaderSession, didDetectNDEFs messages: [NFCNDEFMessage]) {
+        guard session == readSession else { return }
+
         let payloads = messages.flatMap { $0.records }
         let data = payloads.map { record in
             if record.typeNameFormat == .nfcWellKnown,
@@ -55,9 +87,47 @@ class NFCScanner: NSObject, ObservableObject, NFCNDEFReaderSessionDelegate {
                 return record.payload.map { String(format: "%02x", $0) }.joined()
             }
         }.joined(separator: "\n")
+
         DispatchQueue.main.async {
-            let tag = Tag(name: "Untitled", nfcData: data, timestamp: Date())
-            self.tags.append(tag)
+            let newTag = Tag(name: "New Tag", nfcData: data, timestamp: Date())
+            self.tags.append(newTag)
+        }
+
+        session.alertMessage = "NFC tag read successfully!"
+        session.invalidate()
+    }
+
+    // When a tag is found for writing
+    func readerSession(_ session: NFCNDEFReaderSession, didDetect tags: [NFCNDEFTag]) {
+        guard session == writeSession else { return }
+        guard let nfcTag = tags.first, let tagToWrite = tagToWrite else {
+            session.alertMessage = "No tag or no data to write."
+            session.invalidate()
+            return
+        }
+
+        session.connect(to: nfcTag) { [weak self] error in
+            if let error = error {
+                session.alertMessage = "Connection failed: \(error.localizedDescription)"
+                session.invalidate()
+                return
+            }
+
+            let payload = NFCNDEFPayload(format: .nfcWellKnown,
+                                         type: "T".data(using: .utf8)!,
+                                         identifier: Data(),
+                                         payload: tagToWrite.nfcData.data(using: .utf8)!)
+            let message = NFCNDEFMessage(records: [payload])
+
+            nfcTag.writeNDEF(message) { error in
+                if let error = error {
+                    session.alertMessage = "Write failed: \(error.localizedDescription)"
+                } else {
+                    session.alertMessage = "Write successful!"
+                }
+                session.invalidate()
+                self?.tagToWrite = nil
+            }
         }
     }
 
@@ -75,10 +145,10 @@ class NFCScanner: NSObject, ObservableObject, NFCNDEFReaderSessionDelegate {
     }
 }
 
+// MARK: - Main View
 struct ContentView: View {
     @StateObject private var scanner = NFCScanner()
     @State private var selectedTag: Tag?
-    @State private var isEditing = false
 
     var body: some View {
         NavigationView {
@@ -130,8 +200,10 @@ struct ContentView: View {
                     }
                     .listStyle(InsetGroupedListStyle())
                 }
+
                 Spacer()
-                Button(action: { scanner.startScan() }) {
+
+                Button(action: { scanner.startReadSession() }) {
                     Label("Scan NFC", systemImage: "wave.3.right")
                         .font(.title2.bold())
                         .padding()
@@ -162,6 +234,7 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Detail Sheet
 struct TagDetailSheet: View {
     @State var tag: Tag
     @ObservedObject var scanner: NFCScanner
@@ -192,6 +265,7 @@ struct TagDetailSheet: View {
                 }
                 TextField("Enter name", text: $tag.name)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
+
                 Text("Tag Data")
                     .font(.headline)
                 ScrollView {
@@ -201,6 +275,7 @@ struct TagDetailSheet: View {
                         .background(Color(.systemGray6))
                         .cornerRadius(10)
                 }
+
                 Button(action: {
                     UIPasteboard.general.string = tag.nfcData
                     showCopied = true
@@ -216,6 +291,19 @@ struct TagDetailSheet: View {
                 .alert(isPresented: $showCopied) {
                     Alert(title: Text("Copied!"), message: Text("Tag data copied to clipboard."), dismissButton: .default(Text("OK")))
                 }
+
+                Button(action: {
+                    scanner.startWriteSession(with: tag)
+                }) {
+                    Label("Write Tag", systemImage: "square.and.pencil")
+                        .font(.body.bold())
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                        .background(Color.orange)
+                        .foregroundColor(.white)
+                        .cornerRadius(10)
+                }
+
                 Text("Timestamp")
                     .font(.headline)
                 HStack {
@@ -224,6 +312,7 @@ struct TagDetailSheet: View {
                 }
                 .font(.body)
                 .foregroundColor(.secondary)
+
                 Spacer()
             }
             .padding()
@@ -238,7 +327,7 @@ struct TagDetailSheet: View {
     }
 }
 
-// Helper for rounded corners on specific edges
+// MARK: - Rounded corner helper
 extension View {
     func cornerRadius(_ radius: CGFloat, corners: UIRectCorner) -> some View {
         clipShape(RoundedCorner(radius: radius, corners: corners))
@@ -258,3 +347,4 @@ struct RoundedCorner: Shape {
         return Path(path.cgPath)
     }
 }
+
