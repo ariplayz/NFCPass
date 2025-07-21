@@ -1,17 +1,27 @@
 import SwiftUI
 import CoreNFC
 
-// MARK: - Tag model
+// MARK: - Tag Model with Type
+enum TagType: String, Codable, CaseIterable, Identifiable {
+    case text = "Text"
+    case uri = "URI"
+    case mime = "MIME"
+
+    var id: String { rawValue }
+}
+
 struct Tag: Identifiable, Equatable, Codable {
     let id: UUID
     var name: String
-    let nfcData: String
+    var nfcData: String
+    var type: TagType
     let timestamp: Date
 
-    init(id: UUID = UUID(), name: String, nfcData: String, timestamp: Date) {
+    init(id: UUID = UUID(), name: String, nfcData: String, type: TagType = .text, timestamp: Date = Date()) {
         self.id = id
         self.name = name
         self.nfcData = nfcData
+        self.type = type
         self.timestamp = timestamp
     }
 }
@@ -65,7 +75,6 @@ class NFCScanner: NSObject, ObservableObject, NFCNDEFReaderSessionDelegate {
         }
     }
 
-    // ✅ Primary: detects normal NDEF
     func readerSession(_ session: NFCNDEFReaderSession, didDetectNDEFs messages: [NFCNDEFMessage]) {
         guard session == readSession else { return }
         guard let message = messages.first else {
@@ -73,23 +82,12 @@ class NFCScanner: NSObject, ObservableObject, NFCNDEFReaderSessionDelegate {
             session.invalidate()
             return
         }
+
         let payloads = message.records
-        let data = payloads.map { record in
-            if record.typeNameFormat == .nfcWellKnown,
-               let type = String(data: record.type, encoding: .utf8),
-               type == "T",
-               record.payload.count > 3 {
-                let statusByte = record.payload[0]
-                let langCodeLen = Int(statusByte & 0x3F)
-                let textData = record.payload.subdata(in: (1 + langCodeLen)..<record.payload.count)
-                return String(data: textData, encoding: .utf8) ?? "Unreadable tag"
-            } else {
-                return record.payload.map { String(format: "%02x", $0) }.joined()
-            }
-        }.joined(separator: "\n")
+        let data = payloads.map { self.parseRecord($0) }.joined(separator: "\n")
 
         DispatchQueue.main.async {
-            let newTag = Tag(name: "New Tag", nfcData: data, timestamp: Date())
+            let newTag = Tag(name: "New Tag", nfcData: data)
             self.tags.append(newTag)
         }
 
@@ -97,7 +95,6 @@ class NFCScanner: NSObject, ObservableObject, NFCNDEFReaderSessionDelegate {
         session.invalidate()
     }
 
-    // ✅ Fallback: detects empty/unformatted tags
     func readerSession(_ session: NFCNDEFReaderSession, didDetect tags: [NFCNDEFTag]) {
         if session == writeSession {
             handleWrite(tags: tags, session: session)
@@ -114,7 +111,7 @@ class NFCScanner: NSObject, ObservableObject, NFCNDEFReaderSessionDelegate {
                     return
                 }
 
-                tag.queryNDEFStatus { status, capacity, error in
+                tag.queryNDEFStatus { status, _, error in
                     if let error = error {
                         session.alertMessage = "Status failed: \(error.localizedDescription)"
                         session.invalidate()
@@ -132,22 +129,10 @@ class NFCScanner: NSObject, ObservableObject, NFCNDEFReaderSessionDelegate {
                             session.alertMessage = "Read failed: \(error.localizedDescription)"
                         } else if let message = message {
                             let payloads = message.records
-                            let data = payloads.map { record in
-                                if record.typeNameFormat == .nfcWellKnown,
-                                   let type = String(data: record.type, encoding: .utf8),
-                                   type == "T",
-                                   record.payload.count > 3 {
-                                    let statusByte = record.payload[0]
-                                    let langCodeLen = Int(statusByte & 0x3F)
-                                    let textData = record.payload.subdata(in: (1 + langCodeLen)..<record.payload.count)
-                                    return String(data: textData, encoding: .utf8) ?? "Unreadable tag"
-                                } else {
-                                    return record.payload.map { String(format: "%02x", $0) }.joined()
-                                }
-                            }.joined(separator: "\n")
+                            let data = payloads.map { self?.parseRecord($0) ?? "" }.joined(separator: "\n")
 
                             DispatchQueue.main.async {
-                                let newTag = Tag(name: "New Tag", nfcData: data, timestamp: Date())
+                                let newTag = Tag(name: "New Tag", nfcData: data)
                                 self?.tags.append(newTag)
                             }
 
@@ -164,7 +149,7 @@ class NFCScanner: NSObject, ObservableObject, NFCNDEFReaderSessionDelegate {
 
     private func handleWrite(tags: [NFCNDEFTag], session: NFCNDEFReaderSession) {
         guard let nfcTag = tags.first, let tagToWrite = tagToWrite else {
-            session.alertMessage = "No tag or no data to write."
+            session.alertMessage = "No tag or data to write."
             session.invalidate()
             return
         }
@@ -176,10 +161,26 @@ class NFCScanner: NSObject, ObservableObject, NFCNDEFReaderSessionDelegate {
                 return
             }
 
-            let payload = NFCNDEFPayload(format: .nfcWellKnown,
+            let payload: NFCNDEFPayload
+            switch tagToWrite.type {
+            case .text:
+                payload = NFCNDEFPayload(format: .nfcWellKnown,
                                          type: "T".data(using: .utf8)!,
                                          identifier: Data(),
                                          payload: tagToWrite.nfcData.data(using: .utf8)!)
+            case .uri:
+                let uriPayload = Data([0x00]) + (tagToWrite.nfcData.data(using: .utf8) ?? Data())
+                payload = NFCNDEFPayload(format: .nfcWellKnown,
+                                         type: "U".data(using: .utf8)!,
+                                         identifier: Data(),
+                                         payload: uriPayload)
+            case .mime:
+                payload = NFCNDEFPayload(format: .media,
+                                         type: "text/plain".data(using: .utf8)!,
+                                         identifier: Data(),
+                                         payload: tagToWrite.nfcData.data(using: .utf8)!)
+            }
+
             let message = NFCNDEFMessage(records: [payload])
 
             nfcTag.writeNDEF(message) { error in
@@ -193,6 +194,42 @@ class NFCScanner: NSObject, ObservableObject, NFCNDEFReaderSessionDelegate {
             }
         }
     }
+
+    func parseRecord(_ record: NFCNDEFPayload) -> String {
+        switch record.typeNameFormat {
+        case .nfcWellKnown:
+            if let type = String(data: record.type, encoding: .utf8) {
+                if type == "T" {
+                    let statusByte = record.payload[0]
+                    let langCodeLen = Int(statusByte & 0x3F)
+                    let textData = record.payload.subdata(in: (1 + langCodeLen)..<record.payload.count)
+                    return "[Text] " + (String(data: textData, encoding: .utf8) ?? "Unreadable Text")
+                } else if type == "U" {
+                    let uriPayload = record.payload
+                    guard uriPayload.count >= 1 else { return "Invalid URI" }
+                    let uriBody = uriPayload.subdata(in: 1..<uriPayload.count)
+                    let uri = String(data: uriBody, encoding: .utf8) ?? ""
+                    return "[URI] \(uri)"
+                } else {
+                    return "[Well-Known: \(type)] " + record.payload.map { String(format: "%02x", $0) }.joined()
+                }
+            }
+            return "[Well-Known: Unknown type] " + record.payload.map { String(format: "%02x", $0) }.joined()
+
+        case .media:
+            return "[MIME: \(String(data: record.type, encoding: .utf8) ?? "unknown")] " + record.payload.map { String(format: "%02x", $0) }.joined()
+
+        case .absoluteURI:
+            return "[Absolute URI] " + (String(data: record.payload, encoding: .utf8) ?? record.payload.map { String(format: "%02x", $0) }.joined())
+
+        case .nfcExternal:
+            return "[External] " + record.payload.map { String(format: "%02x", $0) }.joined()
+
+        default:
+            return "[Unknown] " + record.payload.map { String(format: "%02x", $0) }.joined()
+        }
+    }
+
 
     private func saveTags() {
         if let data = try? JSONEncoder().encode(tags) {
@@ -212,6 +249,7 @@ class NFCScanner: NSObject, ObservableObject, NFCNDEFReaderSessionDelegate {
 struct ContentView: View {
     @StateObject private var scanner = NFCScanner()
     @State private var selectedTag: Tag?
+    @State private var showCreateSheet = false
 
     var body: some View {
         NavigationView {
@@ -221,7 +259,7 @@ struct ContentView: View {
                         Image(systemName: "tag.slash")
                             .font(.system(size: 48))
                             .foregroundColor(.gray.opacity(0.5))
-                        Text("No Tags Scanned...")
+                        Text("No Tags...")
                             .foregroundColor(.secondary)
                             .font(.headline)
                             .padding(.top, 8)
@@ -240,8 +278,7 @@ struct ContentView: View {
                                 VStack(alignment: .leading, spacing: 6) {
                                     Text(tag.name)
                                         .font(.headline)
-                                        .foregroundColor(.primary)
-                                    Text(tag.nfcData)
+                                    Text("[\(tag.type.rawValue)] \(tag.nfcData)")
                                         .font(.subheadline)
                                         .foregroundColor(.secondary)
                                         .lineLimit(1)
@@ -266,15 +303,26 @@ struct ContentView: View {
 
                 Spacer()
 
-                Button(action: { scanner.startReadSession() }) {
-                    Label("Scan NFC", systemImage: "wave.3.right")
-                        .font(.title2.bold())
-                        .padding()
-                        .frame(maxWidth: .infinity)
-                        .background(Color.blue)
-                        .foregroundColor(.white)
-                        .cornerRadius(12)
-                        .shadow(radius: 2)
+                HStack(spacing: 12) {
+                    Button(action: { showCreateSheet = true }) {
+                        Label("Add Tag", systemImage: "plus")
+                            .font(.title3.bold())
+                            .padding()
+                            .frame(maxWidth: .infinity)
+                            .background(Color.green)
+                            .foregroundColor(.white)
+                            .cornerRadius(12)
+                    }
+
+                    Button(action: { scanner.startReadSession() }) {
+                        Label("Scan NFC", systemImage: "wave.3.right")
+                            .font(.title3.bold())
+                            .padding()
+                            .frame(maxWidth: .infinity)
+                            .background(Color.blue)
+                            .foregroundColor(.white)
+                            .cornerRadius(12)
+                    }
                 }
                 .padding(.horizontal)
                 .padding(.bottom, 24)
@@ -288,6 +336,9 @@ struct ContentView: View {
             .sheet(item: $selectedTag) { tag in
                 TagDetailSheet(tag: tag, scanner: scanner, selectedTag: $selectedTag)
             }
+            .sheet(isPresented: $showCreateSheet) {
+                CreateTagSheet(scanner: scanner, isPresented: $showCreateSheet)
+            }
             .alert("NFC Error", isPresented: .constant(scanner.scanError != nil), actions: {
                 Button("OK") { scanner.scanError = nil }
             }, message: {
@@ -297,7 +348,7 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Detail Sheet
+// MARK: - Tag Detail
 struct TagDetailSheet: View {
     @State var tag: Tag
     @ObservedObject var scanner: NFCScanner
@@ -321,30 +372,24 @@ struct TagDetailSheet: View {
                 }
             }
             VStack(alignment: .leading, spacing: 16) {
-                HStack {
-                    Text("Tag Name")
-                        .font(.headline)
-                    Spacer()
-                }
-                TextField("Enter name", text: $tag.name)
+                TextField("Tag Name", text: $tag.name)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
 
-                Text("Tag Data")
-                    .font(.headline)
-                ScrollView {
-                    Text(tag.nfcData)
-                        .font(.body)
-                        .padding()
-                        .background(Color(.systemGray6))
-                        .cornerRadius(10)
+                Picker("Type", selection: $tag.type) {
+                    ForEach(TagType.allCases) { type in
+                        Text(type.rawValue).tag(type)
+                    }
                 }
+                .pickerStyle(SegmentedPickerStyle())
+
+                TextField("Tag Data", text: $tag.nfcData)
+                    .textFieldStyle(RoundedBorderTextFieldStyle())
 
                 Button(action: {
                     UIPasteboard.general.string = tag.nfcData
                     showCopied = true
                 }) {
                     Label("Copy Tag Data", systemImage: "doc.on.doc")
-                        .font(.body.bold())
                         .frame(maxWidth: .infinity)
                         .padding()
                         .background(Color.green)
@@ -359,22 +404,12 @@ struct TagDetailSheet: View {
                     scanner.startWriteSession(with: tag)
                 }) {
                     Label("Write Tag", systemImage: "square.and.pencil")
-                        .font(.body.bold())
                         .frame(maxWidth: .infinity)
                         .padding()
                         .background(Color.orange)
                         .foregroundColor(.white)
                         .cornerRadius(10)
                 }
-
-                Text("Timestamp")
-                    .font(.headline)
-                HStack {
-                    Text(tag.timestamp, style: .date)
-                    Text(tag.timestamp, style: .time)
-                }
-                .font(.body)
-                .foregroundColor(.secondary)
 
                 Spacer()
             }
@@ -384,7 +419,47 @@ struct TagDetailSheet: View {
         .cornerRadius(20)
         .onDisappear {
             if let idx = scanner.tags.firstIndex(where: { $0.id == tag.id }) {
-                scanner.tags[idx].name = tag.name
+                scanner.tags[idx] = tag
+            }
+        }
+    }
+}
+
+// MARK: - Create Tag Sheet
+struct CreateTagSheet: View {
+    @ObservedObject var scanner: NFCScanner
+    @Binding var isPresented: Bool
+    @State private var name = ""
+    @State private var data = ""
+    @State private var type: TagType = .text
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section(header: Text("Tag Details")) {
+                    TextField("Name", text: $name)
+                    Picker("Type", selection: $type) {
+                        ForEach(TagType.allCases) { type in
+                            Text(type.rawValue).tag(type)
+                        }
+                    }
+                    .pickerStyle(SegmentedPickerStyle())
+                    TextField("Data", text: $data)
+                }
+                Section {
+                    Button("Save") {
+                        let newTag = Tag(name: name.isEmpty ? "New Tag" : name, nfcData: data, type: type)
+                        scanner.tags.append(newTag)
+                        isPresented = false
+                    }
+                    .disabled(data.isEmpty)
+                }
+            }
+            .navigationTitle("New Tag")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { isPresented = false }
+                }
             }
         }
     }
@@ -410,4 +485,3 @@ struct RoundedCorner: Shape {
         return Path(path.cgPath)
     }
 }
-
