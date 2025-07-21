@@ -1,10 +1,3 @@
-//
-//  NFCPassApp.swift
-//  NFCPass
-//
-//  Created by Ari Greene Cummings on 7/20/25.
-//
-
 import SwiftUI
 import SwiftData
 
@@ -25,8 +18,8 @@ struct NFCPassApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            ContentView() // Make sure ContentView exists in your project
         }
-        .modelContainer(sharedModelContainer)
+        .modelContainer(for: Item.self)
     }
 }
